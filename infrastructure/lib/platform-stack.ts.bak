@@ -1,0 +1,757 @@
+import * as cdk from "aws-cdk-lib";
+import { Construct } from "constructs";
+
+import * as ec2 from "aws-cdk-lib/aws-ec2";
+import * as ecs from "aws-cdk-lib/aws-ecs";
+import * as ecr from "aws-cdk-lib/aws-ecr";
+import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
+import * as rds from "aws-cdk-lib/aws-rds";
+import * as sqs from "aws-cdk-lib/aws-sqs";
+import * as elasticache from "aws-cdk-lib/aws-elasticache";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
+import * as backup from "aws-cdk-lib/aws-backup";
+import * as logs from "aws-cdk-lib/aws-logs";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+
+interface CommercePlatformStackProps extends cdk.StackProps {
+  webRepository: ecr.IRepository;
+  workerRepository: ecr.IRepository;
+}
+
+export class CommercePlatformStack extends cdk.Stack {
+
+  public readonly cluster: ecs.Cluster;
+  public readonly webService: ecs.FargateService;
+  public readonly workerService: ecs.FargateService;
+
+  constructor(
+    scope: Construct,
+    id: string,
+    props: CommercePlatformStackProps
+  ) {
+    super(scope, id, props);
+
+    /*
+     * 1. NETWORK
+     */
+
+    const vpc = new ec2.Vpc(this, "CommerceVpc", {
+      vpcName: "commerce-production-vpc",
+      maxAzs: 2,
+      natGateways: 2,
+      subnetConfiguration: [
+        {
+          name: "public",
+          subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask: 24
+        },
+        {
+          name: "application",
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask: 24
+        },
+        {
+          name: "database",
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+          cidrMask: 24
+        }
+      ]
+    });
+
+    /*
+     * 2. SECURITY GROUPS
+     */
+
+    const albSecurityGroup = new ec2.SecurityGroup(
+      this,
+      "CommerceAlbSecurityGroup",
+      {
+        vpc,
+        description: "Public ALB security group",
+        allowAllOutbound: true
+      }
+    );
+
+    albSecurityGroup.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80),
+      "Allow HTTP traffic"
+    );
+
+    const webSecurityGroup = new ec2.SecurityGroup(
+      this,
+      "CommerceWebSecurityGroup",
+      {
+        vpc,
+        description: "Web application tasks",
+        allowAllOutbound: true
+      }
+    );
+
+    webSecurityGroup.addIngressRule(
+      albSecurityGroup,
+      ec2.Port.tcp(3000),
+      "Allow traffic from ALB"
+    );
+
+    const workerSecurityGroup = new ec2.SecurityGroup(
+      this,
+      "CommerceWorkerSecurityGroup",
+      {
+        vpc,
+        description: "Background worker tasks",
+        allowAllOutbound: true
+      }
+    );
+
+    const databaseSecurityGroup = new ec2.SecurityGroup(
+      this,
+      "CommerceDatabaseSecurityGroup",
+      {
+        vpc,
+        description: "PostgreSQL database access",
+        allowAllOutbound: true
+      }
+    );
+
+    databaseSecurityGroup.addIngressRule(
+      webSecurityGroup,
+      ec2.Port.tcp(5432),
+      "Allow web tasks to access PostgreSQL"
+    );
+
+    databaseSecurityGroup.addIngressRule(
+      workerSecurityGroup,
+      ec2.Port.tcp(5432),
+      "Allow worker tasks to access PostgreSQL"
+    );
+
+    const redisSecurityGroup = new ec2.SecurityGroup(
+      this,
+      "CommerceRedisSecurityGroup",
+      {
+        vpc,
+        description: "Redis access",
+        allowAllOutbound: true
+      }
+    );
+
+    redisSecurityGroup.addIngressRule(
+      webSecurityGroup,
+      ec2.Port.tcp(6379),
+      "Allow web tasks to access Redis"
+    );
+
+    /*
+     * 3. DATABASE SECRET
+     */
+
+    const databaseSecret =
+      new secretsmanager.Secret(this, "CommerceDatabaseSecret", {
+        secretName: "commerce/production/database",
+        generateSecretString: {
+          secretStringTemplate: JSON.stringify({
+            username: "commerceadmin"
+          }),
+          generateStringKey: "password",
+          excludePunctuation: true,
+          passwordLength: 32
+        }
+      });
+
+    /*
+     * 4. RDS POSTGRESQL MULTI-AZ
+     */
+
+    const database = new rds.DatabaseInstance(
+      this,
+      "CommercePostgresDatabase",
+      {
+        instanceIdentifier: "commerce-primary-db",
+        engine: rds.DatabaseInstanceEngine.postgres({
+          version: rds.PostgresEngineVersion.VER_17_6
+        }),
+        instanceType: ec2.InstanceType.of(
+          ec2.InstanceClass.BURSTABLE3,
+          ec2.InstanceSize.SMALL
+        ),
+        credentials: rds.Credentials.fromSecret(databaseSecret),
+        databaseName: "commerce",
+        allocatedStorage: 30,
+        maxAllocatedStorage: 100,
+        storageType: rds.StorageType.GP3,
+        multiAz: true,
+        publiclyAccessible: false,
+        vpc,
+        vpcSubnets: {
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED
+        },
+        securityGroups: [databaseSecurityGroup],
+        backupRetention: cdk.Duration.days(7),
+        deletionProtection: true,
+        autoMinorVersionUpgrade: true,
+        storageEncrypted: true,
+        cloudwatchLogsExports: ["postgresql"],
+        cloudwatchLogsRetention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: cdk.RemovalPolicy.RETAIN
+      }
+    );
+
+    /*
+     * 5. REDIS SUBNET GROUP
+     */
+
+    const redisSubnetGroup =
+      new elasticache.CfnSubnetGroup(
+        this,
+        "CommerceRedisSubnetGroup",
+        {
+          description: "Private subnets for commerce Redis",
+          subnetIds: vpc.isolatedSubnets.map(
+            subnet => subnet.subnetId
+          ),
+          cacheSubnetGroupName: "commerce-redis-subnets"
+        }
+      );
+
+    /*
+     * 6. ELASTICACHE REDIS
+     */
+
+    const redis =
+      new elasticache.CfnReplicationGroup(
+        this,
+        "CommerceRedisReplicationGroup",
+        {
+          replicationGroupId: "commerce-cache",
+          replicationGroupDescription:
+            "Highly available commerce Redis cache",
+          engine: "redis",
+          cacheNodeType: "cache.t4g.small",
+          numCacheClusters: 2,
+          automaticFailoverEnabled: true,
+          multiAzEnabled: true,
+          atRestEncryptionEnabled: true,
+          transitEncryptionEnabled: true,
+          cacheSubnetGroupName:
+            redisSubnetGroup.cacheSubnetGroupName,
+          securityGroupIds: [redisSecurityGroup.securityGroupId]
+        }
+      );
+
+    redis.addDependency(redisSubnetGroup);
+
+    /*
+     * 7. SQS DEAD LETTER QUEUE
+     */
+
+    const deadLetterQueue = new sqs.Queue(
+      this,
+      "CommerceDeadLetterQueue",
+      {
+        queueName: "commerce-order-failures",
+        retentionPeriod: cdk.Duration.days(14),
+        encryption: sqs.QueueEncryption.SQS_MANAGED
+      }
+    );
+
+    /*
+     * 8. MAIN ORDER QUEUE
+     */
+
+    const orderQueue = new sqs.Queue(
+      this,
+      "CommerceOrderQueue",
+      {
+        queueName: "commerce-order-processing",
+        visibilityTimeout: cdk.Duration.seconds(120),
+        retentionPeriod: cdk.Duration.days(4),
+        receiveMessageWaitTime: cdk.Duration.seconds(20),
+        encryption: sqs.QueueEncryption.SQS_MANAGED,
+        deadLetterQueue: {
+          queue: deadLetterQueue,
+          maxReceiveCount: 5
+        }
+      }
+    );
+
+    /*
+     * 9. ECS CLUSTER
+     */
+
+    this.cluster = new ecs.Cluster(
+      this,
+      "CommerceEcsCluster",
+      {
+        clusterName: "commerce-runtime-cluster",
+        vpc,
+        containerInsightsV2: ecs.ContainerInsights.ENABLED
+      }
+    );
+
+    /*
+     * 10. WEB TASK DEFINITION
+     */
+
+    const webTaskDefinition =
+      new ecs.FargateTaskDefinition(
+        this,
+        "CommerceWebTaskDefinition",
+        {
+          family: "commerce-web-task",
+          cpu: 512,
+          memoryLimitMiB: 1024
+        }
+      );
+
+    const webContainer =
+      webTaskDefinition.addContainer(
+        "CommerceWebContainer",
+        {
+          containerName: "commerce-web",
+          image: ecs.ContainerImage.fromEcrRepository(
+            props.webRepository,
+            "bootstrap"
+          ),
+          logging: ecs.LogDrivers.awsLogs({
+            streamPrefix: "commerce-web",
+            logRetention: logs.RetentionDays.ONE_MONTH
+          }),
+          environment: {
+            NODE_ENV: "production",
+            PORT: "3000",
+            AWS_REGION: this.region,
+            DB_HOST: database.dbInstanceEndpointAddress,
+            DB_PORT: "5432",
+            DB_NAME: "commerce",
+            REDIS_HOST: redis.attrPrimaryEndPointAddress,
+            REDIS_PORT: "6379",
+            REDIS_TLS: "true",
+            ORDER_QUEUE_URL: orderQueue.queueUrl
+          },
+          secrets: {
+            DB_USER: ecs.Secret.fromSecretsManager(
+              databaseSecret,
+              "username"
+            ),
+            DB_PASSWORD: ecs.Secret.fromSecretsManager(
+              databaseSecret,
+              "password"
+            )
+          },
+          healthCheck: {
+            command: [
+              "CMD-SHELL",
+              "node -e \"require('http').get('http://127.0.0.1:3000/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""
+            ],
+            interval: cdk.Duration.seconds(30),
+            timeout: cdk.Duration.seconds(5),
+            retries: 3,
+            startPeriod: cdk.Duration.seconds(60)
+          }
+        }
+      );
+
+    webContainer.addPortMappings({
+      containerPort: 3000,
+      protocol: ecs.Protocol.TCP
+    });
+
+    /*
+     * 11. WORKER TASK DEFINITION
+     */
+
+    const workerTaskDefinition =
+      new ecs.FargateTaskDefinition(
+        this,
+        "CommerceWorkerTaskDefinition",
+        {
+          family: "commerce-worker-task",
+          cpu: 512,
+          memoryLimitMiB: 1024
+        }
+      );
+
+    workerTaskDefinition.addContainer(
+      "CommerceWorkerContainer",
+      {
+        containerName: "commerce-worker",
+        image: ecs.ContainerImage.fromEcrRepository(
+          props.workerRepository,
+          "bootstrap"
+        ),
+        logging: ecs.LogDrivers.awsLogs({
+          streamPrefix: "commerce-worker",
+          logRetention: logs.RetentionDays.ONE_MONTH
+        }),
+        environment: {
+          NODE_ENV: "production",
+          AWS_REGION: this.region,
+          DB_HOST: database.dbInstanceEndpointAddress,
+          DB_PORT: "5432",
+          DB_NAME: "commerce",
+          ORDER_QUEUE_URL: orderQueue.queueUrl
+        },
+        secrets: {
+          DB_USER: ecs.Secret.fromSecretsManager(
+            databaseSecret,
+            "username"
+          ),
+          DB_PASSWORD: ecs.Secret.fromSecretsManager(
+            databaseSecret,
+            "password"
+          )
+        }
+      }
+    );
+
+    /*
+     * 12. IAM PERMISSIONS
+     */
+
+    orderQueue.grantSendMessages(
+      webTaskDefinition.taskRole
+    );
+
+    orderQueue.grantConsumeMessages(
+      workerTaskDefinition.taskRole
+    );
+
+    databaseSecret.grantRead(
+      webTaskDefinition.executionRole!
+    );
+
+    databaseSecret.grantRead(
+      workerTaskDefinition.executionRole!
+    );
+
+    /*
+     * 13. WEB ECS SERVICE
+     */
+
+    this.webService = new ecs.FargateService(
+      this,
+      "CommerceWebService",
+      {
+        serviceName: "commerce-web-service",
+        cluster: this.cluster,
+        taskDefinition: webTaskDefinition,
+        desiredCount: 2,
+        minHealthyPercent: 100,
+        maxHealthyPercent: 200,
+        assignPublicIp: false,
+        securityGroups: [webSecurityGroup],
+        vpcSubnets: {
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS
+        },
+        circuitBreaker: {
+          rollback: true
+        },
+        healthCheckGracePeriod: cdk.Duration.seconds(90)
+      }
+    );
+
+    /*
+     * 14. WORKER ECS SERVICE
+     */
+
+    this.workerService = new ecs.FargateService(
+      this,
+      "CommerceWorkerService",
+      {
+        serviceName: "commerce-worker-service",
+        cluster: this.cluster,
+        taskDefinition: workerTaskDefinition,
+        desiredCount: 1,
+        minHealthyPercent: 0,
+        maxHealthyPercent: 200,
+        assignPublicIp: false,
+        securityGroups: [workerSecurityGroup],
+        vpcSubnets: {
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS
+        },
+        circuitBreaker: {
+          rollback: true
+        }
+      }
+    );
+
+    /*
+     * 15. APPLICATION LOAD BALANCER
+     */
+
+    const alb = new elbv2.ApplicationLoadBalancer(
+      this,
+      "CommerceApplicationLoadBalancer",
+      {
+        loadBalancerName: "commerce-public-alb",
+        vpc,
+        internetFacing: true,
+        securityGroup: albSecurityGroup,
+        vpcSubnets: {
+          subnetType: ec2.SubnetType.PUBLIC
+        }
+      }
+    );
+
+    const listener = alb.addListener(
+      "CommerceHttpListener",
+      {
+        port: 80,
+        open: false
+      }
+    );
+
+    listener.addTargets(
+      "CommerceWebTargets",
+      {
+        port: 3000,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        targets: [this.webService],
+
+        healthCheck: {
+          protocol: elbv2.Protocol.HTTP,
+          path: "/healthz",
+          healthyHttpCodes: "200",
+          interval: cdk.Duration.seconds(30),
+          timeout: cdk.Duration.seconds(5),
+          healthyThresholdCount: 2,
+          unhealthyThresholdCount: 3
+        }
+      }
+    );
+
+    albSecurityGroup.addEgressRule(
+      webSecurityGroup,
+      ec2.Port.tcp(3000),
+      "Allow ALB traffic to web tasks"
+    );
+
+    /*
+     * 16. WEB AUTOSCALING
+     */
+
+    const webScaling =
+      this.webService.autoScaleTaskCount({
+        minCapacity: 2,
+        maxCapacity: 10
+      });
+
+    webScaling.scaleOnCpuUtilization(
+      "CommerceWebCpuScaling",
+      {
+        targetUtilizationPercent: 60,
+        scaleInCooldown: cdk.Duration.seconds(120),
+        scaleOutCooldown: cdk.Duration.seconds(60)
+      }
+    );
+
+    /*
+     * 17. WORKER AUTOSCALING
+     */
+
+    const workerScaling =
+      this.workerService.autoScaleTaskCount({
+        minCapacity: 1,
+        maxCapacity: 10
+      });
+
+      workerScaling.scaleOnMetric(
+  "CommerceQueueDepthScaling",
+  {
+    metric: orderQueue.metricApproximateNumberOfMessagesVisible({
+      period: cdk.Duration.minutes(1)
+    }),
+
+    adjustmentType:
+      cdk.aws_applicationautoscaling.AdjustmentType.CHANGE_IN_CAPACITY,
+
+    scalingSteps: [
+      {
+        upper: 0,
+        change: -1
+      },
+      {
+        lower: 0,
+        upper: 10,
+        change: 0
+      },
+      {
+        lower: 10,
+        upper: 50,
+        change: 1
+      },
+      {
+        lower: 50,
+        upper: 100,
+        change: 2
+      },
+      {
+        lower: 100,
+        change: 4
+      }
+    ],
+
+    cooldown: cdk.Duration.seconds(60)
+  }
+);
+
+    /*
+     * 18. AWS BACKUP
+     */
+
+    const backupVault = new backup.BackupVault(
+      this,
+      "CommerceBackupVault",
+      {
+        backupVaultName: "commerce-database-vault",
+        removalPolicy: cdk.RemovalPolicy.RETAIN
+      }
+    );
+
+    const backupPlan = backup.BackupPlan.daily35DayRetention(
+      this,
+      "CommerceDatabaseBackupPlan",
+      backupVault
+    );
+
+    backupPlan.addSelection(
+      "CommerceDatabaseBackupSelection",
+      {
+        resources: [
+          backup.BackupResource.fromRdsDatabaseInstance(database)
+        ]
+      }
+    );
+
+    /*
+     * 19. STATIC DISASTER RECOVERY WEBSITE
+     */
+
+    const fallbackWebsite = new s3.Bucket(
+      this,
+      "CommerceContinuityWebsite",
+      {
+        bucketName: "commerce-continuity-site",
+        websiteIndexDocument: "index.html",
+        websiteErrorDocument: "error.html",
+        publicReadAccess: true,
+        blockPublicAccess: new s3.BlockPublicAccess({
+          blockPublicAcls: true,
+          ignorePublicAcls: true,
+          blockPublicPolicy: false,
+          restrictPublicBuckets: false
+        }),
+        encryption: s3.BucketEncryption.S3_MANAGED,
+        enforceSSL: false,
+        removalPolicy: cdk.RemovalPolicy.RETAIN
+      }
+    );
+
+    new s3deploy.BucketDeployment(
+      this,
+      "CommerceFallbackWebsiteDeployment",
+      {
+        sources: [
+          s3deploy.Source.data(
+            "index.html",
+            `<!DOCTYPE html>
+<html>
+<head><title>Commerce Service Continuity</title></head>
+<body>
+<h1>Commerce Service Temporarily Unavailable</h1>
+<p>Our primary service is experiencing an interruption.</p>
+<p>Please try again shortly.</p>
+</body>
+</html>`
+          )
+        ],
+        destinationBucket: fallbackWebsite
+      }
+    );
+
+    /*
+     * 20. MONITORING
+     */
+
+    new cloudwatch.Alarm(
+      this,
+      "CommerceQueueDepthAlarm",
+      {
+        alarmName: "commerce-queue-depth-warning",
+        metric: orderQueue.metricApproximateNumberOfMessagesVisible({
+          period: cdk.Duration.minutes(1)
+        }),
+        threshold: 50,
+        evaluationPeriods: 2,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        alarmDescription:
+          "Commerce order queue depth exceeds 50 messages"
+      }
+    );
+
+    new cloudwatch.Alarm(
+      this,
+      "CommerceDatabaseCpuAlarm",
+      {
+        alarmName: "commerce-database-cpu-warning",
+        metric: database.metricCPUUtilization(),
+        threshold: 80,
+        evaluationPeriods: 3,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD
+      }
+    );
+
+    /*
+     * 21. OUTPUTS
+     */
+
+    new cdk.CfnOutput(this, "CommerceVpcId", {
+      value: vpc.vpcId
+    });
+
+    new cdk.CfnOutput(this, "CommerceClusterName", {
+      value: this.cluster.clusterName
+    });
+
+    new cdk.CfnOutput(this, "CommerceWebServiceName", {
+      value: this.webService.serviceName
+    });
+
+    new cdk.CfnOutput(this, "CommerceWorkerServiceName", {
+      value: this.workerService.serviceName
+    });
+
+    new cdk.CfnOutput(this, "CommerceLoadBalancerDns", {
+      value: alb.loadBalancerDnsName
+    });
+
+    new cdk.CfnOutput(this, "CommerceDatabaseEndpoint", {
+      value: database.dbInstanceEndpointAddress
+    });
+
+    new cdk.CfnOutput(this, "CommerceRedisEndpoint", {
+      value: redis.attrPrimaryEndPointAddress
+    });
+
+    new cdk.CfnOutput(this, "CommerceOrderQueueUrl", {
+      value: orderQueue.queueUrl
+    });
+
+    new cdk.CfnOutput(this, "CommerceDeadLetterQueueUrl", {
+      value: deadLetterQueue.queueUrl
+    });
+
+    new cdk.CfnOutput(this, "CommerceFallbackWebsite", {
+      value: fallbackWebsite.bucketWebsiteUrl
+    });
+
+    new cdk.CfnOutput(this, "CommerceBackupVaultName", {
+      value: backupVault.backupVaultName
+    });
+  }
+}

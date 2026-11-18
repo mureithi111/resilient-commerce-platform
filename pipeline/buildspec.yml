@@ -1,0 +1,39 @@
+version: 0.2
+
+phases:
+
+  pre_build:
+    commands:
+      - echo "Starting Commerce application build"
+      - aws --version
+      - WEB_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${WEB_REPOSITORY}"
+      - WORKER_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${WORKER_REPOSITORY}"
+      - IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+      - IMAGE_TAG="${IMAGE_TAG:0:12}"
+      - echo "Logging into Amazon ECR"
+      - aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+  build:
+    commands:
+      - echo "Building web application image"
+      - docker build -t "${WEB_URI}:${IMAGE_TAG}" ./app/web
+      - docker tag "${WEB_URI}:${IMAGE_TAG}" "${WEB_URI}:bootstrap"
+      - echo "Building worker image"
+      - docker build -t "${WORKER_URI}:${IMAGE_TAG}" ./app/worker
+
+  post_build:
+    commands:
+      - echo "Pushing web image"
+      - docker push "${WEB_URI}:${IMAGE_TAG}"
+      - echo "Pushing worker image"
+      - docker push "${WORKER_URI}:${IMAGE_TAG}"
+      - mkdir -p output
+      - printf '[{"name":"commerce-web","imageUri":"%s"}]' "${WEB_URI}:${IMAGE_TAG}" > output/imagedefinitions-web.json
+      - printf '[{"name":"commerce-worker","imageUri":"%s"}]' "${WORKER_URI}:${IMAGE_TAG}" > output/imagedefinitions-worker.json
+      - echo "Container build completed"
+
+artifacts:
+  files:
+    - output/imagedefinitions-web.json
+    - output/imagedefinitions-worker.json
+  discard-paths: yes

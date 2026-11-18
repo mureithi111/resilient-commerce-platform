@@ -1,0 +1,13 @@
+node_modules/
+**/node_modules/
+cdk.out/
+**/cdk.out/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.vscode/
+.idea/
+infrastructure/.bak

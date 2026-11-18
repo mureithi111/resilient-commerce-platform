@@ -1,0 +1,17 @@
+{
+  "name": "commerce-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Resilient Commerce REST API",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.900.0",
+    "express": "^5.1.0",
+    "pg": "^8.16.3",
+    "redis": "^5.8.0"
+  }
+}
