@@ -9,7 +9,7 @@ phases:
       - WEB_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${WEB_REPOSITORY}"
       - WORKER_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${WORKER_REPOSITORY}"
       - IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION}"
-      - IMAGE_TAG="${IMAGE_TAG:0:12}"
+      - IMAGE_TAG="$(printf '%s' "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-12)"
       - echo "Logging into Amazon ECR"
       - aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
